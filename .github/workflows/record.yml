@@ -1,0 +1,267 @@
+name: Stream Recorder
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "Recording duration per shift in hours (default 2.0; use 0.2 for a 12-min test)"
+        required: false
+        default: "2.0"
+        type: string
+      shifts_left:
+        description: "Continuation shifts if still live at 2h cap (default 1 = up to 8h total; auto-disabled if hours < 1.0)"
+        required: false
+        default: "1"
+        type: string
+      custom_target:
+        description: "Optional single channel override (e.g. @DWNews| or @prankurv123|UCYe2VVWgjUoEEn9LaLSCk9w). Leave empty for full matrix."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - "@Apka-aashu|UCGFi8l9sf5ab4hVJf7byBZg"
+          - "@baskarfiroz15|UCSuA9LrSsE4-GSaSYDUZhNw"
+          - "@anshhhlive_1|UC3NiNPo4kJYnYYhV_6ZnUGw"
+          - "@BagadBillagang-p6s|UC6_0vYIN2dy3MvBuUSvtZJg"
+          - "@_heyb7|UCiFH1EwIHWmPayYRuDGOHPA"
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js 22 (Required for yt-dlp EJS challenge solver)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run Recorder
+        env:
+          TARGET_DATA: ${{ matrix.target }}
+          CUSTOM_TARGET: ${{ github.event.inputs.custom_target }}
+          INPUT_HOURS: ${{ github.event.inputs.hours || '2.0' }}
+          INPUT_SHIFTS_LEFT: ${{ github.event.inputs.shifts_left || '1' }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "$CUSTOM_TARGET" ]; then
+            TARGET_DATA="$CUSTOM_TARGET"
+          fi
+
+          if [ -n "$YT_COOKIES" ]; then
+            printf "%s\n" "$YT_COOKIES" > cookies.txt
+            export USE_COOKIES="true"
+            export COOKIE_FILE="cookies.txt"
+          else
+            export USE_COOKIES="false"
+            export COOKIE_FILE=""
+          fi
+
+          export CHANNEL_HANDLE=$(echo "$TARGET_DATA" | cut -d'|' -f1)
+          export TARGET_CHANNEL_ID=$(echo "$TARGET_DATA" | cut -d'|' -f2)
+          export HOURS="${INPUT_HOURS:-2.0}"
+          export OUT_DIR="./streams"
+
+          # Disable auto-continuation on short tests (< 1.0 hour) so a 12-min @DWNews test doesn't spawn another run
+          export SHIFTS_LEFT=$(python3 -c "h=float('${HOURS}'); s=int('${INPUT_SHIFTS_LEFT:-0}' or 0); print(0 if h < 1.0 else max(0, s))")
+          export ACTIVE_TARGET_DATA="$TARGET_DATA"
+
+          echo "CHANNEL_HANDLE=$CHANNEL_HANDLE" >> "$GITHUB_ENV"
+          echo "ACTIVE_TARGET_DATA=$TARGET_DATA" >> "$GITHUB_ENV"
+          python3 recorder.py
+
+          # Fallback dispatch if pre-warm didn't already fire 3m before end, stream is confirmed live, and SHIFTS_LEFT > 0
+          NEED_DISPATCH=$(python3 - <<'PY'
+          import glob, json
+          for p in glob.glob("./streams/*_summary.json"):
+              try:
+                  d = json.loads(open(p, encoding="utf-8").read())
+                  if d.get("still_live_at_end") and not d.get("continuation_dispatched"):
+                      print("true")
+                      break
+              except Exception:
+                  pass
+          PY
+          )
+          if [ "$NEED_DISPATCH" == "true" ] && [ "${SHIFTS_LEFT:-0}" -gt 0 ] 2>/dev/null; then
+            NEXT_SHIFTS=$((SHIFTS_LEFT - 1))
+            echo "Streamer $CHANNEL_HANDLE confirmed still live at shift end -> dispatching continuation shift (shifts_left=$NEXT_SHIFTS)..."
+            gh workflow run record.yml --ref "${GITHUB_REF_NAME}" \
+              -f hours="${HOURS}" \
+              -f shifts_left="${NEXT_SHIFTS}" \
+              -f custom_target="${TARGET_DATA}" || true
+          fi
+
+      - name: Auto-Upload to Gofile (Bounded Budget + Fallback to Google Drive)
+        if: always()
+        env:
+          RCLONE_CONFIG_SECRET: ${{ secrets.RCLONE_CONFIG }}
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "${CHANNEL_HANDLE:-}" ]; then
+            exit 0
+          fi
+
+          # 1. Stop any lingering downloader/encoder processes and flush file buffers
+          pkill -9 -f ffmpeg 2>/dev/null || true
+          pkill -9 -f yt-dlp 2>/dev/null || true
+          sleep 2
+          sync 2>/dev/null || true
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq curl rclone
+          mkdir -p ./streams
+
+          mapfile -t FILES < <(find ./streams -type f \( -name "*.ts" -o -name "*.part" -o -name "*.mp4" \) ! -name "*_short_exit_*" -size +1M | sort)
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No stream recorded to upload (channel was offline)."
+            echo "### ${CHANNEL_HANDLE}: Offline (No stream recorded)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Prepare rclone config and strictly validate a section with type = drive
+          RCLONE_CONF=""
+          DRIVE_REMOTE=""
+          if [ -n "$RCLONE_CONFIG_SECRET" ]; then
+            printf "%s\n" "$RCLONE_CONFIG_SECRET" > /tmp/rclone.conf
+            chmod 600 /tmp/rclone.conf
+            RCLONE_CONF="/tmp/rclone.conf"
+          elif [ -f "rclone.conf" ]; then
+            RCLONE_CONF="rclone.conf"
+          fi
+
+          if [ -n "$RCLONE_CONF" ] && [ -f "$RCLONE_CONF" ]; then
+            DRIVE_REMOTE=$(python3 - "$RCLONE_CONF" <<'PY'
+          import configparser, sys
+          cp = configparser.ConfigParser(interpolation=None)
+          try:
+              cp.read(sys.argv[1], encoding="utf-8-sig")
+              for sec in cp.sections():
+                  if cp.get(sec, "type", fallback="").strip().lower() == "drive":
+                      print(sec)
+                      break
+          except Exception:
+              pass
+          PY
+            )
+          fi
+
+          echo "### Recording Upload Summary: \`${CHANNEL_HANDLE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+          # Total Gofile time budget across all files = 1800s (30 min), guaranteeing >= 65 min for Drive fallback
+          GOFILE_DEADLINE=$(( $(date +%s) + 1800 ))
+          RUN_UTC_TAG=$(date -u +"%Y%m%d_%H%MUTC")
+
+          for f in "${FILES[@]}"; do
+            FNAME=$(basename "$f")
+            FSIZE_MB=$(du -m "$f" | cut -f1)
+            UPLOAD_LINK=""
+            UPLOAD_METHOD=""
+            STATUS=""
+
+            echo "--------------------------------------------------"
+            NOW_TS=$(date +%s)
+            GOFILE_REM=$(( GOFILE_DEADLINE - NOW_TS ))
+
+            if [ "$GOFILE_REM" -gt 120 ]; then
+              ATTEMPT1_MAX=$(( GOFILE_REM < 1200 ? GOFILE_REM : 1200 ))
+              echo "1) Attempting Gofile upload for $FNAME (${FSIZE_MB} MB, budget=${ATTEMPT1_MAX}s)..."
+
+              AUTH_ARGS=()
+              if [ -n "$GOFILE_TOKEN" ]; then
+                AUTH_ARGS=(-H "Authorization: Bearer $GOFILE_TOKEN")
+              fi
+
+              RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT1_MAX" "${AUTH_ARGS[@]}" -X POST "https://upload.gofile.io/uploadfile" -F "file=@$f" || true)
+              STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+
+              NOW_TS=$(date +%s)
+              GOFILE_REM=$(( GOFILE_DEADLINE - NOW_TS ))
+              if [ "$STATUS" != "ok" ] && [ "$GOFILE_REM" -gt 120 ]; then
+                ATTEMPT2_MAX=$(( GOFILE_REM < 900 ? GOFILE_REM : 900 ))
+                SERVER=$(curl -s --max-time 15 "https://api.gofile.io/servers" | jq -r '.data.servers[0].name // empty' 2>/dev/null || true)
+                if [ -n "$SERVER" ]; then
+                  echo "Retrying Gofile via server ${SERVER}.gofile.io (budget=${ATTEMPT2_MAX}s)..."
+                  RESP=$(curl -s --connect-timeout 20 --max-time "$ATTEMPT2_MAX" "${AUTH_ARGS[@]}" -X POST "https://${SERVER}.gofile.io/uploadFile" -F "file=@$f" || true)
+                  STATUS=$(echo "$RESP" | jq -r '.status // empty' 2>/dev/null || true)
+                fi
+              fi
+            else
+              echo "Gofile 30-min shared budget exhausted -> skipping directly to Google Drive fallback."
+            fi
+
+            if [ "$STATUS" == "ok" ]; then
+              UPLOAD_LINK=$(echo "$RESP" | jq -r '.data.downloadPage // empty' 2>/dev/null || true)
+              UPLOAD_METHOD="Gofile"
+              echo "=================================================="
+              echo "GOFILE UPLOAD SUCCESSFUL!"
+              echo "File: $FNAME (${FSIZE_MB} MB)"
+              echo "Download Link: $UPLOAD_LINK"
+              echo "=================================================="
+            else
+              echo "Gofile upload did not succeed. Falling back to Google Drive..."
+
+              # 2) Fallback to Google Drive via rclone (strictly verified type = drive remote)
+              if [ -n "$RCLONE_CONF" ] && [ -n "$DRIVE_REMOTE" ]; then
+                CLEAN_CH="${CHANNEL_HANDLE#@}"
+                DATE_DIR=$(date -u +"%Y-%m-%d")
+                # Ensure unique filename on Drive across shifts so Shift 2 never overwrites Shift 1
+                case "$FNAME" in
+                  *UTC*) DRIVE_FNAME="$FNAME" ;;
+                  *) DRIVE_FNAME="${RUN_UTC_TAG}_${FNAME}" ;;
+                esac
+                REMOTE_PATH="${DRIVE_REMOTE}:YouTubeRecordings/${CLEAN_CH}/${DATE_DIR}/${DRIVE_FNAME}"
+
+                echo "Uploading to Google Drive -> $REMOTE_PATH ..."
+                if rclone --config "$RCLONE_CONF" copyto "$f" "$REMOTE_PATH" --drive-chunk-size 32M --transfers 1 --retries 3 --low-level-retries 5; then
+                  FILE_ID=$(rclone --config "$RCLONE_CONF" lsjson "$REMOTE_PATH" --stat 2>/dev/null | jq -r '.ID // empty' || true)
+                  if [ -n "$FILE_ID" ]; then
+                    UPLOAD_LINK="https://drive.google.com/file/d/${FILE_ID}/view"
+                  else
+                    UPLOAD_LINK="$REMOTE_PATH"
+                  fi
+                  UPLOAD_METHOD="Google Drive"
+                  echo "=================================================="
+                  echo "GOOGLE DRIVE FALLBACK UPLOAD SUCCESSFUL!"
+                  echo "File: $DRIVE_FNAME (${FSIZE_MB} MB)"
+                  echo "Drive Link: $UPLOAD_LINK"
+                  echo "=================================================="
+                else
+                  echo "ERROR: Google Drive fallback upload also failed for $FNAME"
+                fi
+              else
+                echo "ERROR: Gofile failed and no valid (type = drive) Google Drive remote found in RCLONE_CONFIG!"
+              fi
+            fi
+
+            # Write to GitHub Step Summary & send optional Telegram notification
+            if [ -n "$UPLOAD_LINK" ]; then
+              echo "- ✅ **$FNAME** (${FSIZE_MB} MB) via **${UPLOAD_METHOD}**: $UPLOAD_LINK" >> "$GITHUB_STEP_SUMMARY"
+              if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+                MSG="✅ Stream Uploaded (${UPLOAD_METHOD})%0AChannel: ${CHANNEL_HANDLE}%0AFile: ${FNAME} (${FSIZE_MB} MB)%0ALink: ${UPLOAD_LINK}"
+                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_CHAT_ID}&text=${MSG}" >/dev/null || true
+              fi
+            else
+              echo "- ❌ **$FNAME** (${FSIZE_MB} MB): Both Gofile and Google Drive uploads failed." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
