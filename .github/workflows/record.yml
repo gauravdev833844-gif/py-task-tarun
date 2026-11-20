@@ -70,7 +70,7 @@ jobs:
             export USE_COOKIES="true"
             export COOKIE_FILE="cookies.txt"
           else
-            export USE_COOKIES="false"
+            export USE_COOKIES="true"
             export COOKIE_FILE=""
           fi
 
